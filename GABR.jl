@@ -59,9 +59,9 @@ flush(stdout)
 
     # Define your specific run parameters here:
     const CONFIG = Config(
-        "QTLMAS2010bin.csv",    # <-- CHANGE THIS to your actual CSV file path
+        "Mice_BodyLength.csv",    # <-- CHANGE THIS to your actual CSV file path
         :Y,                     # <-- CHANGE THIS to your target column name
-        "binomial",             # <-- "gaussian" or "binomial"
+        "gaussian",             # <-- "gaussian" or "binomial"
         5,                      # n_folds
         2024,                   # seed
         500,                    # tpe_rounds

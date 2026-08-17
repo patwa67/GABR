@@ -1,1 +1,1 @@
-The Generalized Adaptive Bridge Regression (GABR) framework based on a universal Coordinate Descent solver are implemented in Julia (v1.10) to leverage high-performance Just-In-Time (JIT) compilation.
+The Generalized Adaptive Bridge Regression (GABR) framework based on a universal Coordinate Descent solver are implemented in Julia (v1.10) to leverage high-performance Just-In-Time (JIT) compilation. For details see:  https://doi.org/10.1007/s11222-026-10938-1

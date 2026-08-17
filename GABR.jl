@@ -38,7 +38,7 @@ flush(stdout)
     # SELECTION: Choose one of ["ELASTICNET", "GABR", "GABR-L0", "MCP", "SCAD", "CAPPEDL1", "LOGSUM"]
     const PENALTY_SELECTION = "GABR-L0" 
     
-    # Mathematical zero bound (coefficients smaller than this are set to exactly zero), not valid for GABR-L0
+    # Mathematical zero bound (coefficients smaller than this are set to exactly zero)
     const SPARSITY_THRESHOLD = 1e-8
 
     """
@@ -54,12 +54,13 @@ flush(stdout)
         cd_max_iter::Int                        # Max iterations for inner coordinate descent loop
         cd_tol::Float64                         # Convergence tolerance for coordinate descent
         kkt_max_iter::Int                       # Max iterations for outer empirical KKT active-set updates
+        newt_max_iter::Int                      # Max iterations for Newton-Raphson root solver (GABR)
         fixed_alpha::Union{Float64, Nothing}    # Alpha value for Elastic Net (1.0 = Lasso, 0.0 = Ridge, nothing = Tune)
     end
 
     # Define your specific run parameters here:
     const CONFIG = Config(
-        "Mice_BodyLength.csv",    # <-- CHANGE THIS to your actual CSV file path
+        "Mice_BodyLength.csv",  # <-- CHANGE THIS to your actual CSV file path
         :Y,                     # <-- CHANGE THIS to your target column name
         "gaussian",             # <-- "gaussian" or "binomial"
         5,                      # n_folds
@@ -68,7 +69,8 @@ flush(stdout)
         2000,                   # cd_max_iter 
         1e-7,                   # cd_tol
         100,                    # kkt_max_iter
-        nothing                 # Alpha Setting, only valid for Elastic Net 
+        15,                     # newt_max_iter
+        nothing                 # Alpha Setting 
     )
     
     struct FoldResult
@@ -77,7 +79,7 @@ flush(stdout)
         metric::Float64                    # Test dCor (Gaussian) or AUC (Binomial)
         best_p2::Float64                   # Shape parameter
         best_lam::Float64                  # Regularization strength
-        best_tau::Float64                  # Tau Ratio (Scale-Invariant Truncation proportion for GABR-L0)
+        best_tau::Float64                  # Tau Ratio (Scale-Invariant Truncation proportion)
         beta::Vector{Float64}              # Final coefficient vector (Index 1 is Intercept!)
         tpe_time::Float64                  
         convergence_curve::Vector{Float64} 
@@ -127,14 +129,16 @@ end
     end
 
     # --- Generalized Adaptive Bridge Regression (GABR & GABR-L0) ---
-    @inline function prox_gabr(v::Float64, lambda::Float64, q::Float64, tau_abs::Float64)
+    # ADDED: newt_max argument passed here
+    @inline function prox_gabr(v::Float64, lambda::Float64, q::Float64, tau_abs::Float64, newt_max::Int)
         v_abs = abs(v)
         if v_abs < 1e-15 return 0.0 end
         if abs(q - 1.0) < 1e-9 return sign(v) * max(0.0, v_abs - lambda) end
         if abs(q - 2.0) < 1e-9 return v / (1.0 + 2.0 * lambda) end
         
         x_curr = v_abs
-        for k in 1:15
+        # UPDATED: Loop uses dynamic newt_max
+        for k in 1:newt_max
             if x_curr <= 0.0 x_curr = 0.0; break end
             term    = lambda * q * (x_curr^(q - 1.0))
             f_val   = x_curr - v_abs + term
@@ -212,7 +216,8 @@ end
     Solves penalized regression using Coordinate Descent.
     For Binomial, uses Majorization-Minimization with Bohning's 0.25 Hessian bound.
     """
-    function solve_universal_cd(y, X, lambda_val, param2_val, tau_ratio, beta_init, family)
+    # ADDED: newt_max_iter argument passed to the solver
+    function solve_universal_cd(y, X, lambda_val, param2_val, tau_ratio, beta_init, family, newt_max_iter)
         n, p = size(X)
         beta = copy(beta_init)
         eta = X * beta
@@ -250,8 +255,8 @@ end
                         local_tau = tau_ratio * lam_scaled # SCALE-INVARIANT TRUNCATION
                         
                         if PENALTY_SELECTION == "ELASTICNET" new_bj = prox_elasticnet(z_j, lam_scaled, param2_val)
-                        elseif PENALTY_SELECTION == "GABR" new_bj = prox_gabr(z_j, lam_scaled, param2_val, 0.0)
-                        elseif PENALTY_SELECTION == "GABR-L0" new_bj = prox_gabr(z_j, lam_scaled, param2_val, local_tau)
+                        elseif PENALTY_SELECTION == "GABR" new_bj = prox_gabr(z_j, lam_scaled, param2_val, 0.0, newt_max_iter) # PASS DOWN
+                        elseif PENALTY_SELECTION == "GABR-L0" new_bj = prox_gabr(z_j, lam_scaled, param2_val, local_tau, newt_max_iter) # PASS DOWN
                         elseif PENALTY_SELECTION == "MCP" new_bj = prox_mcp(z_j, lam_scaled, param2_val)
                         elseif PENALTY_SELECTION == "SCAD" new_bj = prox_scad(z_j, lam_scaled, param2_val)
                         elseif PENALTY_SELECTION == "CAPPEDL1" new_bj = prox_capped_l1(z_j, lam_scaled, param2_val)
@@ -290,8 +295,8 @@ end
                     
                     trial_val = 0.0
                     if PENALTY_SELECTION == "ELASTICNET" trial_val = prox_elasticnet(z_j, lam_scaled, param2_val)
-                    elseif PENALTY_SELECTION == "GABR" trial_val = prox_gabr(z_j, lam_scaled, param2_val, 0.0)
-                    elseif PENALTY_SELECTION == "GABR-L0" trial_val = prox_gabr(z_j, lam_scaled, param2_val, local_tau)
+                    elseif PENALTY_SELECTION == "GABR" trial_val = prox_gabr(z_j, lam_scaled, param2_val, 0.0, newt_max_iter) # PASS DOWN
+                    elseif PENALTY_SELECTION == "GABR-L0" trial_val = prox_gabr(z_j, lam_scaled, param2_val, local_tau, newt_max_iter) # PASS DOWN
                     elseif PENALTY_SELECTION == "MCP" trial_val = prox_mcp(z_j, lam_scaled, param2_val)
                     elseif PENALTY_SELECTION == "SCAD" trial_val = prox_scad(z_j, lam_scaled, param2_val)
                     elseif PENALTY_SELECTION == "CAPPEDL1" trial_val = prox_capped_l1(z_j, lam_scaled, param2_val)
@@ -380,7 +385,7 @@ end
         # ------------------------------------------------------------------
         bounds_p2 = (0.0, 0.0)
         if PENALTY_SELECTION == "ELASTICNET" bounds_p2 = (0.0, 1.0)
-        elseif PENALTY_SELECTION in ["GABR", "GABR-L0"] bounds_p2 = (0.1, 2.0)
+        elseif PENALTY_SELECTION in ["GABR", "GABR-L0"] bounds_p2 = (0.5, 2.0) # Numerical stability floor = 0.5
         elseif PENALTY_SELECTION in ["MCP", "SCAD"] bounds_p2 = (1.5, 10.0)
         elseif PENALTY_SELECTION == "CAPPEDL1" bounds_p2 = (0.5, 10.0)
         elseif PENALTY_SELECTION == "LOGSUM" bounds_p2 = (0.01, 1.0)
@@ -404,7 +409,8 @@ end
                 X_curr_tr .= view(X_tr, tr_i, :); y_curr_tr .= view(y_tr, tr_i)
                 X_curr_val .= view(X_tr, val_i, :); y_curr_val .= view(y_tr, val_i)
                 
-                beta_local = solve_universal_cd(y_curr_tr, X_curr_tr, lam_val, p2_safe, tau_ratio_val, zeros(p_aug), conf.family)
+                # EXTRACT conf.newt_max_iter and pass to solver
+                beta_local = solve_universal_cd(y_curr_tr, X_curr_tr, lam_val, p2_safe, tau_ratio_val, zeros(p_aug), conf.family, conf.newt_max_iter)
                 preds_linear = X_curr_val * beta_local
                 
                 if conf.family == "gaussian"
@@ -431,7 +437,7 @@ end
                     
                     # 1. Non-Convex Search
                     space_nc = Dict{Symbol, Any}(
-                        :q       => HP.Uniform(:q_nc, 0.1, 1.0),
+                        :q       => HP.Uniform(:q_nc, 0.5, 1.0),
                         :log_lam => HP.Uniform(:log_lam_nc, bound_log_lam[1], bound_log_lam[2])
                     )
                     function obj_nc(params)
@@ -493,8 +499,8 @@ end
             end 
         end 
 
-        # FINAL REFIT
-        final_beta = solve_universal_cd(y_tr, X_tr, best_params[].lam, best_params[].p2, best_params[].tau, zeros(p_aug), conf.family)
+        # FINAL REFIT: Extract conf.newt_max_iter and pass to solver
+        final_beta = solve_universal_cd(y_tr, X_tr, best_params[].lam, best_params[].p2, best_params[].tau, zeros(p_aug), conf.family, conf.newt_max_iter)
         
         preds_linear = X_te * final_beta
         if conf.family == "gaussian"

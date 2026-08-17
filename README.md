@@ -54,6 +54,3 @@ The TPE optimization trajectory (Mean Loss vs. Iteration).
 
 [PENALTY]_timing.csv
 Wall-clock execution time metrics.
-    15,                     # 10. Max Newton-Raphson iterations (for GABR)
-    nothing                 # 11. Fixed Alpha (for ElasticNet only)
-)

@@ -129,24 +129,76 @@ end
     end
 
     # --- Generalized Adaptive Bridge Regression (GABR & GABR-L0) ---
-    # ADDED: newt_max argument passed here
     @inline function prox_gabr(v::Float64, lambda::Float64, q::Float64, tau_abs::Float64, newt_max::Int)
         v_abs = abs(v)
         if v_abs < 1e-15 return 0.0 end
         if abs(q - 1.0) < 1e-9 return sign(v) * max(0.0, v_abs - lambda) end
         if abs(q - 2.0) < 1e-9 return v / (1.0 + 2.0 * lambda) end
         
+        # Stationarity condition for x > 0: g(x) = x - v_abs + lambda*q*x^(q-1) = 0
+        g_fun(x) = x - v_abs + lambda * q * (x^(q - 1.0))
+
         x_curr = v_abs
-        # UPDATED: Loop uses dynamic newt_max
+        newton_converged = false
         for k in 1:newt_max
             if x_curr <= 0.0 x_curr = 0.0; break end
-            term    = lambda * q * (x_curr^(q - 1.0))
-            f_val   = x_curr - v_abs + term
+            f_val   = g_fun(x_curr)
             f_prime = 1.0 + lambda * q * (q - 1.0) * (x_curr^(q - 2.0))
+            if !isfinite(f_prime) || abs(f_prime) < 1e-14
+                break # Newton step can be unreliable here; hand off to bisection below
+            end
             x_next = max(x_curr - f_val / f_prime, 1e-10) 
-            if abs(x_next - x_curr) < 1e-9 x_curr = x_next; break end
+            if !isfinite(x_next)
+                break
+            end
+            if abs(x_next - x_curr) < 1e-9
+                x_curr = x_next
+                newton_converged = true
+                break
+            end
             x_curr = x_next
         end
+
+        # --- Bisection fallback: Newton did not converge within newt_max iterations ---
+        if !newton_converged
+            lo, hi = 0.0, v_abs
+            valid_bracket = false
+
+            if q < 1.0
+                # g is U-shaped: decreasing then increasing, single interior minimum at x*.
+                # g(v_abs) = lambda*q*v_abs^(q-1) > 0 always, so bracket the larger (relevant)
+                # root in [x*, v_abs], valid whenever g(x*) <= 0.
+                x_star = (-1.0 / (lambda * q * (q - 1.0)))^(1.0 / (q - 2.0))
+                if isfinite(x_star) && x_star > 0.0 && x_star < v_abs && g_fun(x_star) <= 0.0
+                    lo = x_star
+                    valid_bracket = true
+                end
+                # If no valid bracket, g(x) > 0 for all x > 0: the true minimizer is x = 0,
+                # which the threshold check just below will select anyway.
+            else # 1.0 < q < 2.0
+                # g is strictly increasing here (f_prime > 0 everywhere), so any small lo works.
+                lo = 1e-12
+                valid_bracket = g_fun(lo) <= 0.0 && g_fun(hi) >= 0.0
+            end
+
+            if valid_bracket
+                for _ in 1:200
+                    mid = 0.5 * (lo + hi)
+                    if g_fun(mid) > 0.0
+                        hi = mid
+                    else
+                        lo = mid
+                    end
+                    if (hi - lo) < 1e-10
+                        break
+                    end
+                end
+                x_curr = 0.5 * (lo + hi)
+            else
+                x_curr = 0.0
+            end
+        end
+
         if x_curr < 0.0 x_curr = 0.0 end
         
         if q < 1.0
@@ -385,8 +437,9 @@ end
         # ------------------------------------------------------------------
         bounds_p2 = (0.0, 0.0)
         if PENALTY_SELECTION == "ELASTICNET" bounds_p2 = (0.0, 1.0)
-        elseif PENALTY_SELECTION in ["GABR", "GABR-L0"] bounds_p2 = (0.5, 2.0) # Numerical stability floor = 0.5
-        elseif PENALTY_SELECTION in ["MCP", "SCAD"] bounds_p2 = (1.5, 10.0)
+        elseif PENALTY_SELECTION in ["GABR", "GABR-L0"] bounds_p2 = (0.1, 2.0) # Numerical stability floor = 0.1
+        elseif PENALTY_SELECTION == "MCP" bounds_p2 = (1.5, 10.0)
+        elseif PENALTY_SELECTION == "SCAD" bounds_p2 = (2.01, 10.0) # SCAD prox divides by (a-2); must stay strictly > 2
         elseif PENALTY_SELECTION == "CAPPEDL1" bounds_p2 = (0.5, 10.0)
         elseif PENALTY_SELECTION == "LOGSUM" bounds_p2 = (0.01, 1.0)
         end
@@ -602,6 +655,21 @@ insertcols!(df_per_fold, 1, :Feature_Index => feature_labels)
 CSV.write("$(PENALTY_SELECTION)_Coefficients_PerFold_TPE.csv", df_per_fold)
 
 avg_tpe_time = mean([r.tpe_time for r in results])
+
+# Guard: hcat requires every fold's convergence_curve to be the same length.
+for r in results
+    n_curve = length(r.convergence_curve)
+    if n_curve != CONFIG.tpe_rounds
+        @warn "Fold $(r.fold): convergence_curve has $n_curve entries, expected $(CONFIG.tpe_rounds). Adjusting to match."
+        if n_curve < CONFIG.tpe_rounds
+            pad_val = n_curve == 0 ? NaN : r.convergence_curve[end]
+            append!(r.convergence_curve, fill(pad_val, CONFIG.tpe_rounds - n_curve))
+        else
+            resize!(r.convergence_curve, CONFIG.tpe_rounds)
+        end
+    end
+end
+
 curves_matrix = hcat([r.convergence_curve for r in results]...)
 avg_curve = vec(mean(curves_matrix, dims=2))
 

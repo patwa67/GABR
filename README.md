@@ -42,6 +42,7 @@ Or from inside the Julia REPL:
 julia> include("GABR.jl")
 
 5. Once the distributed Cross-Validation finishes, the script prints summary statistics (Loss, AUC/dCor, optimal parameters, and selected feature counts) to the console and generates several artifacts in your working directory:
+
 [PENALTY]_Coefficients_Average_TPE.csv
 Contains the final bagged coefficients (averaged across all outer folds).
 Includes a Stability Score (0.0 to 1.0) indicating the percentage of folds where the feature was selected (non-zero), which is highly useful for robust feature selection.

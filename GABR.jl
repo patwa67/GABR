@@ -7,6 +7,7 @@
 
 using Distributed
 using Pkg
+using Serialization
 
 # --- 0. PACKAGE SETUP ---
 const REQUIRED_PKGS = ["DataFrames", "CSV", "SpecialFunctions", "Distributions", 
@@ -56,6 +57,8 @@ flush(stdout)
         kkt_max_iter::Int                       # Max iterations for outer empirical KKT active-set updates
         newt_max_iter::Int                      # Max iterations for Newton-Raphson root solver (GABR)
         fixed_alpha::Union{Float64, Nothing}    # Alpha value for Elastic Net (1.0 = Lasso, 0.0 = Ridge, nothing = Tune)
+        k_inner::Int                            # Inner CV folds per repeat (higher -> closer to LOOCV, more compute)
+        n_inner_repeats::Int                    # Independent inner-split repeats, averaged (reduces single-split noise)
     end
 
     # Define your specific run parameters here:
@@ -63,14 +66,16 @@ flush(stdout)
         "Mice_BodyLength.csv",  # <-- CHANGE THIS to your actual CSV file path
         :Y,                     # <-- CHANGE THIS to your target column name
         "gaussian",             # <-- "gaussian" or "binomial"
-        5,                      # n_folds
+        10,                     # n_folds        <-- was 5; raised toward DESIRED_WORKERS so folds still run in ~1 parallel wave, not serialized
         2024,                   # seed
         500,                    # tpe_rounds
         2000,                   # cd_max_iter 
         1e-7,                   # cd_tol
         100,                    # kkt_max_iter
         15,                     # newt_max_iter
-        nothing                 # Alpha Setting 
+        nothing,                # Alpha Setting 
+        2,                      # k_inner        <-- back to the original minimum; leakage fix costs nothing extra, repeats do
+        2                       # n_inner_repeats <-- back to 1: stability now comes from MORE OUTER folds, not from padding inner CV
     )
     
     struct FoldResult
@@ -78,7 +83,8 @@ flush(stdout)
         loss::Float64                      # Test MSE (Gaussian) or Log-Loss (Binomial)
         metric::Float64                    # Test dCor (Gaussian) or AUC (Binomial)
         best_p2::Float64                   # Shape parameter
-        best_lam::Float64                  # Regularization strength
+        best_lam::Float64                  # Regularization strength (raw, calibrated to THIS fold's n_tr)
+        lam_max::Float64                   # This fold's own lambda scale anchor (n_tr-dependent) — use best_lam/lam_max to transfer across dataset sizes
         best_tau::Float64                  # Tau Ratio (Scale-Invariant Truncation proportion)
         beta::Vector{Float64}              # Final coefficient vector (Index 1 is Intercept!)
         tpe_time::Float64                  
@@ -129,6 +135,7 @@ end
     end
 
     # --- Generalized Adaptive Bridge Regression (GABR & GABR-L0) ---
+    # ADDED: newt_max argument passed here
     @inline function prox_gabr(v::Float64, lambda::Float64, q::Float64, tau_abs::Float64, newt_max::Int)
         v_abs = abs(v)
         if v_abs < 1e-15 return 0.0 end
@@ -145,7 +152,7 @@ end
             f_val   = g_fun(x_curr)
             f_prime = 1.0 + lambda * q * (q - 1.0) * (x_curr^(q - 2.0))
             if !isfinite(f_prime) || abs(f_prime) < 1e-14
-                break # Newton step can be unreliable here; hand off to bisection below
+                break # Newton step is unreliable here; hand off to bisection below
             end
             x_next = max(x_curr - f_val / f_prime, 1e-10) 
             if !isfinite(x_next)
@@ -396,23 +403,63 @@ end
         n_tr = length(y_tr)
 
         # ------------------------------------------------------------------
-        # Setup Inner CV (3-Fold) for Robust TPE Evaluation
+        # Setup Inner CV for TPE Evaluation
         # ------------------------------------------------------------------
-        perm = shuffle(1:n_tr)
-        k_inner = 3 
-        fold_sz = floor(Int, n_tr / k_inner)
-        stochastic_folds = []
-        for k in 1:k_inner
-            s = (k-1)*fold_sz + 1
-            e = (k == k_inner) ? n_tr : k*fold_sz
-            val_idx = perm[s:e]
-            tr_idx  = setdiff(perm, val_idx)
-            push!(stochastic_folds, (tr_idx, val_idx))
+        # Design goals:
+        #  - LOOCV-like stability: k_inner folds per repeat, larger inner-
+        #     training sets (lower bias) and more left-out groups averaged
+        #     (lower variance in the loss estimate) than a single 3-way split,
+        #     without literally doing n_tr-fold LOOCV (not compute-feasible
+        #     at this p). n_inner_repeats independent splits are generated
+        #     and their losses averaged, so the ensemble stands in for "more
+        #     folds" when k_inner alone is capped by compute budget.
+        #  - TPE cannot overfit one static partition: all k_inner*n_inner_
+        #     repeats splits are generated ONCE, before the search starts,
+        #     and every TPE trial is judged against the SAME fixed ensemble
+        #     average — comparable across trials, fully reproducible, but no
+        #     single split's idiosyncrasies dominate the ranking.
+        #  - No leakage: each split's standardization (and, for gaussian,
+        #     its y-centering) is computed from ONLY that split's inner-
+        #     training rows, never from its inner-validation rows.
+        inner_splits = NamedTuple{(:X_tr, :y_tr, :X_val, :y_val), Tuple{Matrix{Float64}, Vector{Float64}, Matrix{Float64}, Vector{Float64}}}[]
+
+        for rep in 1:conf.n_inner_repeats
+            Random.seed!(conf.seed + fold_id * 1000 + rep) # deterministic per (outer fold, repeat)
+            perm = shuffle(1:n_tr)
+            fold_sz = floor(Int, n_tr / conf.k_inner)
+            for k in 1:conf.k_inner
+                s = (k - 1) * fold_sz + 1
+                e = (k == conf.k_inner) ? n_tr : k * fold_sz
+                val_idx = perm[s:e]
+                tr_idx  = setdiff(perm, val_idx)
+
+                # Standardize using ONLY this split's inner-training rows
+                Xi_tr_raw  = view(X_tr_raw, tr_idx, :)
+                Xi_val_raw = view(X_tr_raw, val_idx, :)
+                mxi = mean(Xi_tr_raw, dims=1)
+                sxi = std(Xi_tr_raw, dims=1) .+ 1e-6
+                Xi_tr_std  = hcat(ones(length(tr_idx)), (Xi_tr_raw .- mxi) ./ sxi)
+                Xi_val_std = hcat(ones(length(val_idx)), (Xi_val_raw .- mxi) ./ sxi)
+
+                yi_tr_raw  = y_tr_raw[tr_idx]
+                yi_val_raw = y_tr_raw[val_idx]
+                if conf.family == "gaussian"
+                    myi = mean(yi_tr_raw)
+                    yi_tr  = yi_tr_raw .- myi
+                    yi_val = yi_val_raw .- myi # center validation targets with the INNER-TRAINING mean only
+                else
+                    yi_tr  = yi_tr_raw
+                    yi_val = yi_val_raw
+                end
+
+                push!(inner_splits, (X_tr=Xi_tr_std, y_tr=yi_tr, X_val=Xi_val_std, y_val=yi_val))
+            end
         end
-        
-        max_tr_len = maximum(length(f[1]) for f in stochastic_folds)
-        max_val_len = maximum(length(f[2]) for f in stochastic_folds)
-        
+
+        n_inner_splits = length(inner_splits)
+        max_tr_len  = maximum(size(s.X_tr, 1) for s in inner_splits)
+        max_val_len = maximum(size(s.X_val, 1) for s in inner_splits)
+
         X_tr_buf = Matrix{Float64}(undef, max_tr_len, p_aug)
         y_tr_buf = Vector{Float64}(undef, max_tr_len)
         X_val_buf = Matrix{Float64}(undef, max_val_len, p_aug)
@@ -437,7 +484,7 @@ end
         # ------------------------------------------------------------------
         bounds_p2 = (0.0, 0.0)
         if PENALTY_SELECTION == "ELASTICNET" bounds_p2 = (0.0, 1.0)
-        elseif PENALTY_SELECTION in ["GABR", "GABR-L0"] bounds_p2 = (0.1, 2.0) # Numerical stability floor = 0.1
+        elseif PENALTY_SELECTION in ["GABR", "GABR-L0"] bounds_p2 = (0.1, 2.0) # Numerical stability floor = 0.5
         elseif PENALTY_SELECTION == "MCP" bounds_p2 = (1.5, 10.0)
         elseif PENALTY_SELECTION == "SCAD" bounds_p2 = (2.01, 10.0) # SCAD prox divides by (a-2); must stay strictly > 2
         elseif PENALTY_SELECTION == "CAPPEDL1" bounds_p2 = (0.5, 10.0)
@@ -455,12 +502,13 @@ end
             p2_safe = clamp(p2_val, bounds_p2[1], bounds_p2[2])
             total_loss = 0.0
             
-            for (tr_i, val_i) in stochastic_folds
-                X_curr_tr = view(X_tr_buf, 1:length(tr_i), :); y_curr_tr = view(y_tr_buf, 1:length(tr_i))
-                X_curr_val = view(X_val_buf, 1:length(val_i), :); y_curr_val = view(y_val_buf, 1:length(val_i))
+            for split in inner_splits
+                n_tr_i = size(split.X_tr, 1); n_val_i = size(split.X_val, 1)
+                X_curr_tr = view(X_tr_buf, 1:n_tr_i, :); y_curr_tr = view(y_tr_buf, 1:n_tr_i)
+                X_curr_val = view(X_val_buf, 1:n_val_i, :); y_curr_val = view(y_val_buf, 1:n_val_i)
                 
-                X_curr_tr .= view(X_tr, tr_i, :); y_curr_tr .= view(y_tr, tr_i)
-                X_curr_val .= view(X_tr, val_i, :); y_curr_val .= view(y_tr, val_i)
+                X_curr_tr .= split.X_tr; y_curr_tr .= split.y_tr
+                X_curr_val .= split.X_val; y_curr_val .= split.y_val
                 
                 # EXTRACT conf.newt_max_iter and pass to solver
                 beta_local = solve_universal_cd(y_curr_tr, X_curr_tr, lam_val, p2_safe, tau_ratio_val, zeros(p_aug), conf.family, conf.newt_max_iter)
@@ -474,7 +522,7 @@ end
                 end
             end
             
-            return total_loss / k_inner # Return the AVERAGE loss across folds
+            return total_loss / n_inner_splits # Return the AVERAGE loss across the whole split ensemble
         end
 
         if fold_id == 1
@@ -490,7 +538,7 @@ end
                     
                     # 1. Non-Convex Search
                     space_nc = Dict{Symbol, Any}(
-                        :q       => HP.Uniform(:q_nc, 0.5, 1.0),
+                        :q       => HP.Uniform(:q_nc, 0.1, 1.0),
                         :log_lam => HP.Uniform(:log_lam_nc, bound_log_lam[1], bound_log_lam[2])
                     )
                     function obj_nc(params)
@@ -570,7 +618,7 @@ end
         
         println("Fold $fold_id Finished. Test Loss=$(round(test_loss,digits=4)) | $metric_name=$(round(test_metric,digits=4)) | Time=$(round(tpe_time,digits=2))s")
         
-        return FoldResult(fold_id, test_loss, test_metric, best_params[].p2, best_params[].lam, best_params[].tau, final_beta, tpe_time, convergence_curve)
+        return FoldResult(fold_id, test_loss, test_metric, best_params[].p2, best_params[].lam, lam_max, best_params[].tau, final_beta, tpe_time, convergence_curve)
     end
 end
 
@@ -657,6 +705,8 @@ CSV.write("$(PENALTY_SELECTION)_Coefficients_PerFold_TPE.csv", df_per_fold)
 avg_tpe_time = mean([r.tpe_time for r in results])
 
 # Guard: hcat requires every fold's convergence_curve to be the same length.
+# TreeParzen.fmin should call the objective exactly tpe_rounds times, but if it
+# ever dedupes or short-circuits, pad/truncate here instead of crashing on hcat.
 for r in results
     n_curve = length(r.convergence_curve)
     if n_curve != CONFIG.tpe_rounds
@@ -683,6 +733,7 @@ loss_scores   = [r.loss for r in results]
 metric_scores  = [r.metric for r in results]
 p2_scores    = [r.best_p2 for r in results]
 lam_scores   = [r.best_lam for r in results]
+lam_ratio_scores = [r.best_lam / r.lam_max for r in results]  # scale-invariant: transferable across dataset sizes
 tau_scores   = [r.best_tau for r in results]
 
 # Sparsity score strictly checks non-intercept features (rows 2:end)
@@ -697,6 +748,7 @@ println("Test $loss_label:         $(round(mean(loss_scores), digits=4)) ± $(ro
 println("Test $metr_label:              $(round(mean(metric_scores), digits=4)) ± $(round(std(metric_scores), digits=4))")
 println("Best Param2 (Shape):  $(round(mean(p2_scores), digits=4)) ± $(round(std(p2_scores), digits=4))")
 println("Best Lambda:          $(round(mean(lam_scores), digits=4)) ± $(round(std(lam_scores), digits=4))")
+println("Best Lambda Ratio (λ/λ_max, scale-invariant): $(round(mean(lam_ratio_scores), digits=4)) ± $(round(std(lam_ratio_scores), digits=4))")
 if PENALTY_SELECTION == "GABR-L0"
     println("Best Tau Ratio (L0):  $(round(mean(tau_scores), digits=6)) ± $(round(std(tau_scores), digits=6))")
 end
@@ -707,3 +759,75 @@ df_agg = DataFrame(Feature_Index = feature_labels, Bagged_Beta = avg_beta, Stabi
 sort!(df_agg, [:Stability_Score, :Bagged_Beta], rev=true)
 CSV.write("$(PENALTY_SELECTION)_Coefficients_Average_TPE.csv", df_agg)
 println("Saved aggregated coefficients.")
+
+# ==============================================================================
+# 7. SAVE FINAL MODEL FOR FUTURE PREDICTIONS
+# ==============================================================================
+# CV folds are for HONEST EVALUATION only — each one was trained on a subset of
+# the data with its own fold-specific normalization, so no single fold's beta is
+# the "deployable" model. Standard practice: take the hyperparameters CV selected
+# (already averaged above), then refit ONE final model on the FULL dataset.
+
+struct SavedModel
+    penalty::String
+    family::String
+    feature_names::Vector{String}   # excludes intercept
+    beta::Vector{Float64}           # beta[1] = intercept, beta[2:end] = features
+    x_mean::Vector{Float64}         # for normalizing new raw X the same way
+    x_std::Vector{Float64}
+    y_mean::Float64                 # 0.0 for binomial (no centering applied)
+    p2::Float64
+    lambda::Float64
+    tau::Float64
+end
+
+println("\n=== REFITTING FINAL MODEL ON FULL DATASET ===")
+
+final_p2  = mean(p2_scores)
+final_tau = PENALTY_SELECTION == "GABR-L0" ? mean(tau_scores) : 0.0
+
+full_mx = vec(mean(X_raw, dims=1))
+full_sx = vec(std(X_raw, dims=1)) .+ 1e-6
+X_full_norm = (X_raw .- full_mx') ./ full_sx'
+X_full_aug = hcat(ones(n_total), X_full_norm)
+
+full_my = CONFIG.family == "gaussian" ? mean(y_raw) : 0.0
+y_full  = CONFIG.family == "gaussian" ? (y_raw .- full_my) : y_raw
+
+# --- Rescale lambda for the full dataset's own scale ---
+# Each fold's raw best_lam was calibrated to that fold's n_tr (~4/5 of n_total,
+# since the outer fold's own held-out slice is excluded). lam_max — the anchor
+# TPE's search bounds were built around — grows with n_tr, so a raw lambda from
+# a smaller fold isn't directly transferable to a larger refit. The RATIO
+# lambda/lam_max is transferable: it's "what fraction of this dataset's own
+# correlation scale did CV pick as the penalty." Recompute lam_max on the full
+# dataset (same formula run_tpe_fold uses) and rescale by that ratio instead.
+full_lam_max = maximum(abs.(X_full_norm' * (y_full .- mean(y_full))))
+final_lam_ratio = mean(lam_ratio_scores)
+final_lam = final_lam_ratio * full_lam_max
+
+naive_lam = mean(lam_scores)  # what this would have used before the fix, for comparison
+println("  Full-data lambda scale (λ_max):        $(round(full_lam_max, digits=2))")
+println("  CV-selected ratio (λ/λ_max):            $(round(final_lam_ratio, digits=4))")
+println("  Rescaled lambda for refit:              $(round(final_lam, digits=2))")
+println("  (naive raw-mean lambda would have been: $(round(naive_lam, digits=2)))")
+
+final_beta_full = solve_universal_cd(
+    y_full, X_full_aug, final_lam, final_p2, final_tau,
+    zeros(p_features + 1), CONFIG.family, CONFIG.newt_max_iter
+)
+
+saved_model = SavedModel(
+    PENALTY_SELECTION, CONFIG.family, string.(1:p_features),
+    final_beta_full, full_mx, full_sx, full_my,
+    final_p2, final_lam, final_tau
+)
+
+model_path = "$(PENALTY_SELECTION)_final_model.jls"
+serialize(model_path, saved_model)
+
+n_selected = count(x -> abs(x) > SPARSITY_THRESHOLD, final_beta_full[2:end])
+println("Saved final model -> $model_path")
+println("  Hyperparameters: p2=$(round(final_p2,digits=4)), lambda=$(round(final_lam,digits=4)), tau=$(round(final_tau,digits=6))")
+println("  Non-zero coefficients: $n_selected / $p_features")
+println("  Use predict_gabr.jl to load this file and score new data.")

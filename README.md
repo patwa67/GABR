@@ -1,17 +1,17 @@
 The Generalized Adaptive Bridge Regression (GABR) framework based on a universal Coordinate Descent solver are implemented in Julia (v1.10) to leverage high-performance Just-In-Time (JIT) compilation. For details see:  https://doi.org/10.1007/s11222-026-10938-1
 Note that some improvements have been done on the CV implementation for better stability, the GABR-L0 penalty allows for tuning of the variable selection threshold in the 'dense' bridge domain (1 < q < 2) and binary responses can now be analyzed. In addition, some printing errors in the paper are outlined in the errata document ErrataStatComp.doc.
 
-1. Prerequisites
+1. Prerequisites:
 You only need to have Julia installed. The script will automatically detect and install all required Julia packages (e.g., DataFrames, TreeParzen, CSV) on its first run.
 
-2. Prepare Your Data
+2. Prepare Your Data:
 Ensure your dataset is a clean .csv file where all features are numeric columns with headings.
 
 For Gaussian (regression): Target variable should be continuous.
 
 For Binomial (classification): Target variable must be binary (0 or 1).
 
-3. Configure the Script
+3. Configure the Script:
 Open the script and locate the 1. USER CONFIGURATION block. Update the PENALTY_SELECTION and the CONFIG struct to match your dataset:
 
 Julia
@@ -32,7 +32,7 @@ const CONFIG = Config(
     nothing                 # 11. Fixed Alpha (for ElasticNet only)
 )
 
-4. Run the Pipeline
+4. Run the Pipeline:
 You can run the script directly from your terminal:
 Bash
 julia GABR.jl

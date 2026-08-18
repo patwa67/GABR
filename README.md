@@ -34,11 +34,11 @@ const CONFIG = Config(
 
 4. Run the Pipeline:
 You can run the script directly from your terminal:
-Bash
+
 julia GABR.jl
 
 Or from inside the Julia REPL:
-Julia
+
 julia> include("GABR.jl")
 
 5. Once the distributed Cross-Validation finishes, the script prints summary statistics (Loss, AUC/dCor, optimal parameters, and selected feature counts) to the console and generates several artifacts in your working directory:

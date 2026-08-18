@@ -1,5 +1,5 @@
 The Generalized Adaptive Bridge Regression (GABR) framework based on a universal Coordinate Descent solver are implemented in Julia (v1.10) to leverage high-performance Just-In-Time (JIT) compilation. For details see:  https://doi.org/10.1007/s11222-026-10938-1
-Note that some improvements have been done on the CV implementation for better stability, the GABR-L0 penalty allows for tuning of the variable selection threshold in the 'dense' bridge domain (1 < q < 2) and binary responses can now be analyzed. In addition, some printing errors in the paper are outlined in the errata document ErrataStatComp.doc.
+Note that some improvements have been done on the CV implementation for better stability, the GABR-L0 penalty allows for tuning of the variable selection threshold in the 'dense' bridge domain (1 < q < 2) and binary responses can now be analyzed. In addition, some printing errors in the paper are outlined in the errata document: ErrataStatComp.doc.
 
 1. Prerequisites:
 You only need to have Julia installed. The script will automatically detect and install all required Julia packages (e.g., DataFrames, TreeParzen, CSV) on its first run.

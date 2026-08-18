@@ -57,5 +57,5 @@ The TPE optimization trajectory (Mean Loss vs. Iteration).
 Wall-clock execution time metrics.
 
 
-6. The PREDICT_GABR.jl performs predictions based on the saved model. You need to specify on which data file you want to do predictions and then just run:
-   julia> include("PREDICT_GABR.jl") which will save the predictions and residuals to a file.
+6. The PREDICT_GABR.jl performs predictions based on the saved model. You need to specify on which data file (same format as the training data with NA if you have no true observations of Y) you want to do predictions and then just run:
+julia> include("PREDICT_GABR.jl") which will save the predictions and residuals to a file.
